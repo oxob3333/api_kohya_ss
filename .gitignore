@@ -2,3 +2,24 @@
 /sql_app.db
 /trained_models
 /uploaded_images
+
+# Entornos Virtuales
+# Ignora cualquier carpeta llamada venv en cualquier lugar del proyecto.
+venv/
+__pycache__/
+
+# Bases de datos y resultados de Celery
+# Estos archivos se generan localmente.
+*.db
+*.sqlite3
+
+# Datos generados por la API
+# Estas carpetas las crea la aplicación al ejecutarse. No deben estar en Git.
+/uploaded_images/
+/trained_models/
+
+# Archivos de IDE y sistema operativo
+# Basura que generan los editores de código y los SO.
+.vscode/
+.idea/
+*.DS_Store
