@@ -159,12 +159,18 @@ def train_kohya_model(
             training_params.get("optimizer_type", "AdamW8bit"),
             "--caption_extension",
             ".txt",
+            "--lr_scheduler",
+            training_params.get("lr_scheduler", "constant"),
         ]
 
         if training_params.get("use_xformers", True):
             command.append("--xformers")
         if training_params.get("enable_bucket", False):
             command.append("--enable_bucket")
+        if training_params.get("cache_latents"):
+            command.append("--cache_latents")
+        if training_params.get("bucket_no_upscale"):
+            command.append("--bucket_no_upscale")
 
         print(f"\n[{datetime.now()}] Ejecutando comando: {' '.join(command)}")
 
