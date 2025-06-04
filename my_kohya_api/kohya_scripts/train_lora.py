@@ -5,26 +5,17 @@ import sys
 from datetime import datetime
 
 # --- CONFIGURA LA RUTA BASE A TU INSTALACIÓN DE KOHYA_SS ---
-# Esta es la carpeta principal donde clonaste el repositorio de Kohya_SS.
-KOHYA_SS_PATH = "D:\\doria\\Stable\\kohya_ss"
+KOHYA_SS_PATH = os.path.join(os.path.expanduser("~"), "kohya_ss")
 
 # --- RUTA ABSOLUTA AL INTÉRPRETE DE PYTHON EN TU VENV DE KOHYA_SS ---
-# Esta es la ruta que obtuviste con 'where python' dentro del venv de Kohya_SS.
-# ¡ES CRÍTICO QUE ESTA RUTA SEA EXACTA!
-KOHYA_SS_PYTHON_EXECUTABLE = "D:\\doria\\Stable\\kohya_ss\\venv\\Scripts\\python.exe"
+KOHYA_SS_PYTHON_EXECUTABLE = os.path.join(KOHYA_SS_PATH, "venv", "bin", "python")
 
 # Asegúrate de que el script principal de entrenamiento de Kohya_SS exista
-# La ruta al script específico dentro de Kohya_SS es 'sd-scripts/train_network.py'
 TRAIN_NETWORK_SCRIPT = os.path.join(KOHYA_SS_PATH, "sd-scripts", "train_network.py")
 
-# --- Verificaciones de Rutas (Ayuda a depurar si algo no está bien) ---
 if not os.path.exists(TRAIN_NETWORK_SCRIPT):
     print(
         f"[{datetime.now()}] ERROR: No se encontró el script de entrenamiento de Kohya_SS en: {TRAIN_NETWORK_SCRIPT}",
-        file=sys.stderr,
-    )
-    print(
-        f"[{datetime.now()}] Asegúrate de que KOHYA_SS_PATH ({KOHYA_SS_PATH}) sea correcto y que el archivo {os.path.basename(TRAIN_NETWORK_SCRIPT)} exista dentro de sd-scripts.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -34,27 +25,18 @@ if not os.path.exists(KOHYA_SS_PYTHON_EXECUTABLE):
         f"[{datetime.now()}] ERROR: No se encontró el ejecutable de Python de Kohya_SS Venv en: {KOHYA_SS_PYTHON_EXECUTABLE}",
         file=sys.stderr,
     )
-    print(
-        f"[{datetime.now()}] Asegúrate de que KOHYA_SS_PYTHON_EXECUTABLE sea la ruta correcta al python.exe dentro de tu entorno virtual de Kohya_SS.",
-        file=sys.stderr,
-    )
     sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Invoca el script real de entrenamiento LoRA de Kohya_SS."
     )
-    # Define los argumentos que tu tarea de Celery (train_kohya_model) le pasará
+    # Argumentos existentes
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
         required=True,
         help="Ruta al modelo Stable Diffusion base para entrenar LoRA.",
-    )
-    parser.add_argument(
-        "--enable_bucket",
-        action="store_true",
-        help="Habilitar el sistema de cubos de Kohya_SS para redimensionamiento inteligente.",
     )
     parser.add_argument(
         "--train_data_dir",
@@ -137,14 +119,34 @@ if __name__ == "__main__":
         default=".txt",
         help="Extensión de los archivos de caption.",
     )
+    parser.add_argument(
+        "--enable_bucket",
+        action="store_true",
+        help="Habilitar el sistema de cubos de Kohya_SS para redimensionamiento inteligente.",
+    )
+
+    # --- NUEVOS ARGUMENTOS AÑADIDOS ---
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        help="Learning rate scheduler (ej. 'cosine', 'constant', 'cosine_with_restarts').",
+    )
+    parser.add_argument(
+        "--cache_latents", action="store_true", help="Habilitar el cacheo de latentes."
+    )
+    parser.add_argument(
+        "--bucket_no_upscale",
+        action="store_true",
+        help="Deshabilitar el upscaling en los buckets, útil si las imágenes ya tienen el tamaño deseado o se quieren buckets más pequeños.",
+    )
+    # --- FIN DE NUEVOS ARGUMENTOS ---
 
     args = parser.parse_args()
 
-    # --- Construye el comando de línea de Kohya_SS ---
-    # ¡¡¡IMPORTANTE: Usamos KOHYA_SS_PYTHON_EXECUTABLE para forzar el uso del Python del venv de Kohya_SS!!!
     kohya_command = [
         KOHYA_SS_PYTHON_EXECUTABLE,
-        TRAIN_NETWORK_SCRIPT,  # <--- ¡AHORA USA LA RUTA ABSOLUTA DEL VENV!
+        TRAIN_NETWORK_SCRIPT,
         "--pretrained_model_name_or_path",
         args.pretrained_model_name_or_path,
         "--train_data_dir",
@@ -170,22 +172,29 @@ if __name__ == "__main__":
         "--caption_extension",
         args.caption_extension,
         "--save_every_n_epochs",
-        "1",  # Puedes parametrizar esto también
+        "1",
         "--save_model_as",
-        "safetensors",  # Formato de salida del modelo
+        "safetensors",
         "--seed",
         str(args.seed),
         "--mixed_precision",
         args.mixed_precision,
         "--network_module",
-        "networks.lora",  # <--- ¡AÑADE ESTA LÍNEA!
+        "networks.lora",
+        # --- AÑADIR NUEVOS ARGUMENTOS AL COMANDO REAL DE KOHYA ---
+        "--lr_scheduler",
+        args.lr_scheduler,
     ]
 
-    if args.enable_bucket:  # <-- AÑADE ESTO
+    if args.enable_bucket:
         kohya_command.append("--enable_bucket")
-
     if args.xformers:
         kohya_command.append("--xformers")
+    if args.cache_latents:
+        kohya_command.append("--cache_latents")
+    if args.bucket_no_upscale:
+        kohya_command.append("--bucket_no_upscale")
+    # --- FIN DE AÑADIR NUEVOS ARGUMENTOS ---
 
     print(f"\n[{datetime.now()}] Ejecutando comando real de Kohya_SS:")
     print(f"{' '.join(kohya_command)}\n")
