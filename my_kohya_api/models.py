@@ -1,7 +1,7 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
 from datetime import datetime
 
@@ -27,13 +27,19 @@ class DBTrainingTask(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
-    status = Column(String, default="pending")
+    celery_task_id = Column(
+        String, nullable=True, index=True
+    )  # NUEVO: ID de la tarea Celery
+    status = Column(
+        String, default="pending"
+    )  # pending, initializing, processing, completed, failed
     model_type = Column(String)
-    dataset_path = Column(String)
-    output_model_path = Column(String, nullable=True)
+    dataset_path = Column(String)  # Ruta base donde se extraen las imágenes
+    output_model_path = Column(String, nullable=True)  # Ruta al modelo LoRA final
     prompt_config = Column(
         String, nullable=True
-    )  # JSON string of prompt configurations
+    )  # JSON string de la configuración de prompt
+    error_message = Column(Text, nullable=True)  # NUEVO: Para guardar mensajes de error
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -63,30 +69,30 @@ class Token(BaseModel):
     token_type: str
 
 
-class TrainingTaskCreate(BaseModel):
-    model_type: str = "lora"
-    prompt: str = "default prompt for training"
-    instance_count: int = 10  # <--- NUEVO: Cuenta de instancias para Kohya_SS
-    class_name: str = (
-        "my_concept"  # <--- NUEVO: Nombre de la clase para Kohya_SS (ej. "person", "style")
-    )
-    num_epochs: int = 10
-    learning_rate: float = 1e-4
-    resolution: int = 512
-    batch_size: int = 1
-    mixed_precision: str = "fp16"
-    use_xformers: bool = True
-    seed: int = -1
+# TrainingTaskCreate ya no se usa directamente si todos los params son Form en el endpoint
+# class TrainingTaskCreate(BaseModel):
+#     # ... (podrías mantenerlo si tienes una estructura de datos interna)
 
 
 class TrainingTaskResponse(BaseModel):
     id: int
     user_id: int
+    celery_task_id: Optional[str] = None
     status: str
     model_type: str
     dataset_path: str
     output_model_path: Optional[str] = None
     prompt_config: Optional[str] = None
+    error_message: Optional[str] = None
+
+    # Campos para el progreso en tiempo real
+    progress_text: Optional[str] = Field(
+        default=None, description="Última línea de log relevante o mensaje de progreso."
+    )
+    progress_percent: Optional[float] = Field(
+        default=None, description="Porcentaje de progreso estimado."
+    )
+
     created_at: datetime
     updated_at: datetime
 

@@ -3,7 +3,7 @@ import shutil
 import json
 import zipfile
 import io
-from typing import List
+from typing import List, Optional  # Asegúrate de que Optional esté aquí
 from datetime import datetime
 
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
@@ -12,12 +12,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 # Importa tus módulos locales
-from .database import (
-    engine,
-    Base,
-    SessionLocal,
-    get_db,
-)  # Asegúrate de importar SessionLocal y get_db
+from .database import engine, Base, SessionLocal, get_db
 from .models import (
     DBUser,
     UserCreate,
@@ -26,24 +21,25 @@ from .models import (
     DBTrainingTask,
     TrainingTaskResponse,
 )
-from .auth import (  # Asegúrate de que las importaciones de auth sean correctas
+from .auth import (
     get_password_hash,
     verify_password,
     create_access_token,
     get_current_user,
-    # ¡NUEVA DEPENDENCIA QUE AÑADIREMOS EN auth.py!
-    get_current_master_user,  # Renombrada para claridad, la crearemos en auth.py
+    get_current_master_user,
 )
-from .tasks import train_kohya_model, UPLOADED_IMAGES_DIR, TRAINED_MODELS_DIR
+from .tasks import (
+    train_kohya_model,
+    UPLOADED_IMAGES_DIR,
+    TRAINED_MODELS_DIR,
+    celery_app,
+)  # Importar celery_app
 
 
 # --- Credenciales del Usuario Maestro ---
-# ¡¡¡IMPORTANTE!!! Para producción, considera seriamente leer esto desde variables de entorno.
-# Por ahora, usamos tus valores especificados como default si no hay variables de entorno.
 MASTER_USERNAME = os.environ.get("MASTER_USER_USERNAME", "dorian")
 MASTER_PASSWORD = os.environ.get("MASTER_USER_PASSWORD", "doritos")
 MASTER_EMAIL = os.environ.get("MASTER_USER_EMAIL", "dorian_ain@hotmail.com")
-
 
 app = FastAPI(title="Kohya_SS Training API")
 
@@ -51,13 +47,12 @@ app = FastAPI(title="Kohya_SS Training API")
 @app.on_event("startup")
 def on_startup():
     print("Ejecutando evento de inicio...")
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine)  # Esto crea las tablas si no existen
     print("Tablas de base de datos verificadas/creadas.")
     os.makedirs(UPLOADED_IMAGES_DIR, exist_ok=True)
     os.makedirs(TRAINED_MODELS_DIR, exist_ok=True)
     print("Directorios de datos asegurados.")
 
-    # --- Crear Usuario Maestro si no existe ---
     db: Session = SessionLocal()
     try:
         master_user = (
@@ -71,8 +66,6 @@ def on_startup():
                 hashed_password=hashed_password,
                 email=MASTER_EMAIL,
                 is_active=True,
-                # Aquí podrías añadir un campo 'is_superuser=True' a tu modelo DBUser
-                # y establecerlo aquí para una verificación más formal en la dependencia.
             )
             db.add(db_master_user)
             db.commit()
@@ -87,12 +80,10 @@ def on_startup():
     print("Evento de inicio completado.")
 
 
-# --- Endpoint de Registro AHORA PROTEGIDO ---
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register_user(
-    user_to_create: UserCreate,  # Los datos del nuevo usuario a crear
+    user_to_create: UserCreate,
     db: Session = Depends(get_db),
-    # ¡Esta dependencia asegura que solo el maestro pueda usar este endpoint!
     current_master_user: DBUser = Depends(get_current_master_user),
 ):
     print(
@@ -115,7 +106,7 @@ def register_user(
         username=user_to_create.username,
         hashed_password=hashed_password,
         email=user_to_create.email,
-        is_active=True,  # Por defecto, los usuarios creados por el admin están activos
+        is_active=True,
     )
     db.add(new_db_user)
     db.commit()
@@ -149,54 +140,26 @@ def read_users_me(current_user: DBUser = Depends(get_current_user)):
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_training_task(
-    # Parámetros de Formulario para Kohya_SS
-    model_type: str = Form("lora", description="Tipo de modelo a entrenar, ej. 'lora'"),
-    prompt: str = Form(
-        "a photo of sks style",
-        description="Prompt base para las imágenes de instancia.",
-    ),
-    instance_count: int = Form(
-        10,
-        description="Número de repeticiones por imagen de instancia (ej. 10_nombreclase).",
-    ),
-    class_name: str = Form(
-        "concept",
-        description="Nombre de la clase para la carpeta (ej. 10_nombreclase).",
-    ),
-    num_epochs: int = Form(5, description="Número de épocas de entrenamiento."),
-    learning_rate: float = Form(1e-5, description="Tasa de aprendizaje."),
-    resolution: int = Form(512, description="Resolución de entrenamiento (cuadrada)."),
-    train_batch_size: int = Form(
-        1, description="Tamaño del lote de entrenamiento por dispositivo."
-    ),
-    mixed_precision: str = Form(
-        "fp16", description="Precisión mixta (no, fp16, bf16)."
-    ),
-    use_xformers: bool = Form(True, description="Usar xformers para optimización."),
-    enable_bucket: bool = Form(True, description="Habilitar bucketing."),
-    seed: int = Form(
-        -1, description="Semilla para reproducibilidad (-1 para aleatorio)."
-    ),
-    output_name: str = Form(
-        "my_trained_model",
-        description="Nombre base para el archivo del modelo LoRA resultante.",
-    ),
-    cache_latents: bool = Form(
-        True, description="Cachear latentes para acelerar el entrenamiento."
-    ),
-    bucket_no_upscale: bool = Form(
-        True,
-        description="No agrandar imágenes en buckets, usar su resolución más cercana.",
-    ),
-    lr_scheduler: str = Form(
-        "cosine", description="Planificador de tasa de aprendizaje."
-    ),
-    network_dim: int = Form(128, description="Dimensión de la red LoRA (rank)."),
-    network_alpha: int = Form(64, description="Alpha para la red LoRA."),
-    optimizer_type: str = Form("AdamW8bit", description="Optimizador a usar."),
-    zip_file: UploadFile = File(
-        ..., description="Archivo .zip conteniendo las imágenes de entrenamiento."
-    ),
+    model_type: str = Form("lora"),
+    prompt: str = Form("a photo of sks style"),
+    instance_count: int = Form(10),
+    class_name: str = Form("concept"),
+    num_epochs: int = Form(5),
+    learning_rate: float = Form(1e-5),
+    resolution: int = Form(512),
+    train_batch_size: int = Form(1),
+    mixed_precision: str = Form("fp16"),
+    use_xformers: bool = Form(True),
+    enable_bucket: bool = Form(True),
+    seed: int = Form(-1),
+    output_name: str = Form("my_trained_model"),
+    cache_latents: bool = Form(True),
+    bucket_no_upscale: bool = Form(True),
+    lr_scheduler: str = Form("cosine"),
+    network_dim: int = Form(128),
+    network_alpha: int = Form(64),
+    optimizer_type: str = Form("AdamW8bit"),
+    zip_file: UploadFile = File(...),
     current_user: DBUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -287,11 +250,8 @@ async def create_training_task(
             "output_name": output_name,
         }
     )
-    db.add(db_training_task)
-    db.commit()
-    db.refresh(db_training_task)
 
-    train_kohya_model.delay(
+    celery_task_obj = train_kohya_model.delay(
         db_training_task.id,
         current_user.id,
         user_task_base_dir,
@@ -299,6 +259,11 @@ async def create_training_task(
         training_params,
         saved_filenames,
     )
+    db_training_task.celery_task_id = celery_task_obj.id  # Guardar ID de Celery
+
+    db.add(db_training_task)
+    db.commit()
+    db.refresh(db_training_task)
     return db_training_task
 
 
@@ -320,16 +285,69 @@ def get_training_task_status(
     current_user: DBUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    task = (
+    db_task = (
         db.query(DBTrainingTask)
         .filter(DBTrainingTask.id == task_id, DBTrainingTask.user_id == current_user.id)
         .first()
     )
-    if not task:
+    if not db_task:
         raise HTTPException(
             status_code=404, detail="Training task not found or unauthorized."
         )
-    return task
+
+    current_celery_status = db_task.status
+    progress_text_from_celery = None
+    progress_percent_from_celery = None
+    error_message_from_celery = db_task.error_message  # Usar el de la BD como fallback
+
+    if db_task.celery_task_id:
+        async_result = celery_app.AsyncResult(db_task.celery_task_id)
+        current_celery_status = async_result.state
+
+        if async_result.state == "PROGRESS":
+            if isinstance(async_result.info, dict):
+                progress_text_from_celery = async_result.info.get("progress_text")
+                progress_percent_from_celery = async_result.info.get("progress_percent")
+        elif async_result.state == "FAILURE":
+            error_message_from_celery = str(async_result.info)
+            if (
+                db_task.status != "failed"
+                or db_task.error_message != error_message_from_celery
+            ):
+                db_task.status = "failed"
+                db_task.error_message = error_message_from_celery
+                db.commit()
+        elif async_result.state == "SUCCESS":
+            if db_task.status != "completed":
+                db_task.status = "completed"  # Marcar como completado si Celery lo dice y BD no lo está
+                db_task.error_message = (
+                    None  # Limpiar errores previos si ahora es SUCCESS
+                )
+                db.commit()
+
+    # Si el estado de la BD es 'processing' pero Celery no tiene info de progreso detallada,
+    # o si la tarea aún no ha sido recogida por Celery (estado Celery es PENDING).
+    if current_celery_status == "PROCESSING" and not progress_text_from_celery:
+        progress_text_from_celery = "Procesando, esperando detalles de Kohya..."
+    elif current_celery_status == "PENDING" and db_task.status == "pending":
+        progress_text_from_celery = "Tarea pendiente en la cola de Celery..."
+
+    # Construir la respuesta Pydantic
+    return TrainingTaskResponse(
+        id=db_task.id,
+        user_id=db_task.user_id,
+        celery_task_id=db_task.celery_task_id,
+        status=current_celery_status,  # Priorizar estado de Celery
+        model_type=db_task.model_type,
+        dataset_path=db_task.dataset_path,
+        output_model_path=db_task.output_model_path,
+        prompt_config=db_task.prompt_config,
+        error_message=error_message_from_celery,
+        progress_text=progress_text_from_celery,
+        progress_percent=progress_percent_from_celery,
+        created_at=db_task.created_at,
+        updated_at=db_task.updated_at,  # La BD actualiza esto, o Celery podría si es necesario
+    )
 
 
 @app.get("/download-model/{task_id}")
@@ -347,10 +365,20 @@ async def download_trained_model(
         raise HTTPException(
             status_code=404, detail="Training task not found or unauthorized."
         )
-    if task.status != "completed" or not task.output_model_path:
+
+    # Consultar el estado real de Celery aquí también podría ser útil antes de permitir la descarga
+    celery_status_for_download = task.status
+    if task.celery_task_id:
+        celery_status_for_download = celery_app.AsyncResult(task.celery_task_id).state
+
+    if (
+        celery_status_for_download != "SUCCESS" or not task.output_model_path
+    ):  # Chequear contra SUCCESS de Celery
         raise HTTPException(
-            status_code=400, detail="Model not available or training failed."
+            status_code=400,
+            detail="Model not available or training did not complete successfully.",
         )
+
     if not os.path.exists(task.output_model_path) or not os.path.isfile(
         task.output_model_path
     ):
