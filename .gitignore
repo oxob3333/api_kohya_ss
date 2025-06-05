@@ -2,7 +2,7 @@
 /sql_app.db
 /trained_models
 /uploaded_images
-
+/my_kohya_api/__pycache__/
 # Entornos Virtuales
 # Ignora cualquier carpeta llamada venv en cualquier lugar del proyecto.
 venv/
