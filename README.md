@@ -28,7 +28,7 @@ El sistema se compone de varios servicios desacoplados que trabajan en conjunto:
 
 ## 🚀 Guía de Instalación y Ejecución
 
-Este sistema está diseñado para correr en un entorno **WSL 2** para un rendimiento óptimo.
+Este sistema está diseñado para correr en un entorno **WSL 2** para un rendimiento óptimo, pero puede ser usado en entornos de linux sin problema.
 
 ### Prerrequisitos
 

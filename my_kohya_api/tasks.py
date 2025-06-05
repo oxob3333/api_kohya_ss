@@ -1,390 +1,391 @@
 import os
 import shutil
 import json
-import zipfile
-import io
-from typing import List, Optional  # Asegúrate de que Optional esté aquí
-from datetime import datetime
-
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
-from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.responses import FileResponse
+import subprocess
+from celery import Celery
 from sqlalchemy.orm import Session
+from datetime import datetime
+import sys
+import random
+import re  # Importar el módulo de expresiones regulares
+from typing import List
 
-# Importa tus módulos locales
-from .database import engine, Base, SessionLocal, get_db
-from .models import (
-    DBUser,
-    UserCreate,
-    UserResponse,
-    Token,
-    DBTrainingTask,
-    TrainingTaskResponse,
+# Importa desde tus módulos locales
+from .database import SessionLocal
+from .models import DBTrainingTask
+
+# --- Configuración de Celery ---
+# Asegúrate de que el nombre de la app Celery aquí coincida con el usado en app.py para AsyncResult
+celery_app = Celery(
+    "my_kohya_api_tasks",  # Este nombre es el que usa app.py al importar celery_app
+    broker="amqp://guest:guest@localhost:5672//",
+    backend="db+sqlite:///./celery_results.db",  # Asegúrate que esta ruta sea accesible por el worker
 )
-from .auth import (
-    get_password_hash,
-    verify_password,
-    create_access_token,
-    get_current_user,
-    get_current_master_user,
+
+celery_app.conf.update(
+    task_track_started=True,
+    worker_prefetch_multiplier=1,
+    broker_connection_retry_on_startup=True,
+    task_acks_late=True,  # Considerar para tareas largas, para que no se re-ejecuten si el worker muere
+    task_reject_on_worker_lost=True,  # Con acks_late, si el worker muere, la tarea se re-encola
 )
-from .tasks import (
-    train_kohya_model,
-    UPLOADED_IMAGES_DIR,
-    TRAINED_MODELS_DIR,
-    celery_app,
-)  # Importar celery_app
+
+# --- Rutas de Archivos (Ajusta según tu estructura de proyecto real) ---
+# Asumiendo que tasks.py está en my_kohya_api/ y la raíz del proyecto contiene la carpeta api_kohya_ss
+# Si api_kohya_ss ES la raíz del proyecto (donde está el .git), entonces PROJECT_ROOT sería:
+# PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Y las carpetas uploaded_images y trained_models estarían en api_kohya_ss/uploaded_images etc.
+
+# Asumamos que la estructura es:
+# raiz_proyecto/
+#   api_kohya_ss/  <-- Aquí está manage.py o el punto de entrada de uvicorn
+#     my_kohya_api/  <-- Tu módulo FastAPI
+#       tasks.py
+#       app.py
+#       models.py
+#       kohya_scripts/
+#         train_lora.py
+#     uploaded_images/
+#     trained_models/
+#     celery_results.db
+#     sql_app.db
+
+# Si esta es la estructura, PROJECT_ROOT apunta a la carpeta api_kohya_ss
+APP_ROOT_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..")
+)  # Esto sería api_kohya_ss/my_kohya_api/
+PROJECT_ROOT_FOR_DATA = os.path.abspath(
+    os.path.join(APP_ROOT_DIR, "..")
+)  # Esto sería api_kohya_ss/
+
+UPLOADED_IMAGES_DIR = os.path.join(PROJECT_ROOT_FOR_DATA, "uploaded_images")
+TRAINED_MODELS_DIR = os.path.join(PROJECT_ROOT_FOR_DATA, "trained_models")
+KOHYA_SCRIPTS_DIR = os.path.join(
+    APP_ROOT_DIR, "kohya_scripts"
+)  # my_kohya_api/kohya_scripts/
 
 
-# --- Credenciales del Usuario Maestro ---
-MASTER_USERNAME = os.environ.get("MASTER_USER_USERNAME", "dorian")
-MASTER_PASSWORD = os.environ.get("MASTER_USER_PASSWORD", "doritos")
-MASTER_EMAIL = os.environ.get("MASTER_USER_EMAIL", "dorian_ain@hotmail.com")
+@celery_app.task(
+    bind=True, name="my_kohya_api_tasks.train_kohya_model"
+)  # Es buena práctica nombrar las tareas
+def train_kohya_model(
+    self,
+    task_id: int,
+    user_id: int,
+    user_task_base_dir: str,
+    model_type: str,
+    training_params: dict,
+    saved_filenames: List[str],
+):
+    db = SessionLocal()
+    db_task_obj = None
 
-app = FastAPI(title="Kohya_SS Training API")
-
-
-@app.on_event("startup")
-def on_startup():
-    print("Ejecutando evento de inicio...")
-    Base.metadata.create_all(bind=engine)  # Esto crea las tablas si no existen
-    print("Tablas de base de datos verificadas/creadas.")
-    os.makedirs(UPLOADED_IMAGES_DIR, exist_ok=True)
-    os.makedirs(TRAINED_MODELS_DIR, exist_ok=True)
-    print("Directorios de datos asegurados.")
-
-    db: Session = SessionLocal()
     try:
-        master_user = (
-            db.query(DBUser).filter(DBUser.username == MASTER_USERNAME).first()
+        db_task_obj = (
+            db.query(DBTrainingTask).filter(DBTrainingTask.id == task_id).first()
         )
-        if not master_user:
-            print(f"Usuario maestro '{MASTER_USERNAME}' no encontrado, creándolo...")
-            hashed_password = get_password_hash(MASTER_PASSWORD)
-            db_master_user = DBUser(
-                username=MASTER_USERNAME,
-                hashed_password=hashed_password,
-                email=MASTER_EMAIL,
-                is_active=True,
+        if not db_task_obj:
+            msg = f"DBTrainingTask {task_id} no encontrada para Celery task {self.request.id}"
+            print(f"Error crítico: {msg}")
+            self.update_state(
+                state="FAILURE",
+                meta={
+                    "exc_type": "DBTaskNotFound",
+                    "exc_message": msg,
+                    "progress_text": msg,
+                },
             )
-            db.add(db_master_user)
+            # No se puede actualizar el estado de db_task_obj si no se encuentra
+            return  # Termina la tarea Celery
+
+        # Sincronizar el ID de la tarea Celery en la BD si no se guardó antes o cambió
+        if db_task_obj.celery_task_id != self.request.id:
+            db_task_obj.celery_task_id = self.request.id
+
+        db_task_obj.status = "processing"
+        db.commit()  # Guardar celery_task_id y status="processing"
+
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "progress_text": "Iniciando configuración de Kohya_SS...",
+                "progress_percent": 0.0,
+            },
+        )
+
+        print(
+            f"[{datetime.now()}] Iniciando entrenamiento para la tarea de BD {task_id} (Celery ID: {self.request.id}, Usuario: {user_id})"
+        )
+        print(f"[{datetime.now()}] Directorio base de la tarea: {user_task_base_dir}")
+
+        instance_count = training_params.get("instance_count", 10)
+        class_name = training_params.get("class_name", "concept")
+        user_prompt = training_params.get("prompt", "a photo of sks style")
+        output_name_from_user = training_params.get(
+            "output_name", f"model_{model_type}_{task_id}"
+        )
+
+        kohya_dataset_dir = os.path.join(
+            user_task_base_dir, f"{instance_count}_{class_name}"
+        )
+        os.makedirs(kohya_dataset_dir, exist_ok=True)
+        print(f"[{datetime.now()}] Creando subcarpeta de Kohya_SS: {kohya_dataset_dir}")
+
+        actual_filenames_in_kohya_dir = []
+        for filename in saved_filenames:
+            original_file_path = os.path.join(user_task_base_dir, filename)
+            kohya_target_file_path = os.path.join(kohya_dataset_dir, filename)
+            if os.path.exists(original_file_path):
+                shutil.move(original_file_path, kohya_target_file_path)
+                base_name = os.path.splitext(filename)[0]
+                txt_filename = base_name + ".txt"
+                txt_filepath = os.path.join(kohya_dataset_dir, txt_filename)
+                with open(txt_filepath, "w", encoding="utf-8") as f:
+                    f.write(user_prompt)
+                actual_filenames_in_kohya_dir.append(filename)
+            else:
+                print(
+                    f"   Advertencia: Archivo {original_file_path} no encontrado para mover."
+                )
+
+        if not actual_filenames_in_kohya_dir:
+            raise Exception(
+                "No image files were successfully moved to Kohya dataset directory."
+            )
+
+        print(
+            f"--- Movimiento y captions para {len(actual_filenames_in_kohya_dir)} imágenes completados. ---"
+        )
+
+        actual_seed = training_params.get("seed", -1)
+        if actual_seed == -1 or actual_seed is None:
+            actual_seed = random.randint(0, 2**32 - 1)
+
+        output_dir_for_kohya_models = os.path.join(
+            TRAINED_MODELS_DIR, f"user_{user_id}", f"task_{task_id}"
+        )
+        os.makedirs(output_dir_for_kohya_models, exist_ok=True)
+        output_model_path_full = os.path.join(
+            output_dir_for_kohya_models, f"{output_name_from_user}.safetensors"
+        )
+
+        kohya_script_wrapper_path = os.path.join(KOHYA_SCRIPTS_DIR, "train_lora.py")
+
+        command = [
+            sys.executable,
+            kohya_script_wrapper_path,
+            "--pretrained_model_name_or_path",
+            training_params.get(
+                "pretrained_model_name_or_path", "runwayml/stable-diffusion-v1-5"
+            ),
+            "--train_data_dir",
+            user_task_base_dir,
+            "--output_dir",
+            output_dir_for_kohya_models,
+            "--output_name",
+            output_name_from_user,
+            "--resolution",
+            str(training_params.get("resolution", 512)),
+            "--train_batch_size",
+            str(training_params.get("train_batch_size", 1)),
+            "--num_epochs",
+            str(training_params.get("num_epochs", 10)),
+            "--learning_rate",
+            str(training_params.get("learning_rate", 1e-5)),
+            "--mixed_precision",
+            training_params.get("mixed_precision", "fp16"),
+            "--seed",
+            str(actual_seed),
+            "--network_dim",
+            str(training_params.get("network_dim", 128)),
+            "--network_alpha",
+            str(training_params.get("network_alpha", 64)),
+            "--optimizer_type",
+            training_params.get("optimizer_type", "AdamW8bit"),
+            "--caption_extension",
+            ".txt",
+            "--lr_scheduler",
+            training_params.get("lr_scheduler", "cosine"),
+        ]
+        if training_params.get("use_xformers", True):
+            command.append("--xformers")
+        if training_params.get("enable_bucket", True):
+            command.append("--enable_bucket")
+        if training_params.get("cache_latents", True):
+            command.append("--cache_latents")
+        if training_params.get("bucket_no_upscale", True):
+            command.append("--bucket_no_upscale")
+
+        print(
+            f"\n[{datetime.now()}] Ejecutando comando para tarea {task_id}: {' '.join(command)}"
+        )
+
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=KOHYA_SCRIPTS_DIR,
+        )
+
+        print(
+            f"\n[{datetime.now()}] Iniciando streaming del proceso Kohya_SS para tarea {task_id}..."
+        )
+        last_meaningful_log = "Iniciando entrenamiento..."
+        log_buffer = []
+
+        if process.stdout:
+            for line_num, line in enumerate(iter(process.stdout.readline, "")):
+                print(line, end="")
+                cleaned_line = line.strip()
+                log_buffer.append(cleaned_line)
+                if (
+                    len(log_buffer) > 20
+                ):  # Mantener solo las últimas 20 líneas, por ejemplo
+                    log_buffer.pop(0)
+
+                meta_update = {"progress_text": cleaned_line, "progress_percent": None}
+                current_percent = None
+
+                progress_match = re.search(
+                    r"steps:\s*(\d+)%\s*\|.*?\|\s*(\d+)/(\d+).*?avr_loss=([\d.]+)",
+                    cleaned_line,
+                )
+                simple_percent_match = re.search(r"^\s*(\d+)\s*%\|", cleaned_line)
+
+                if progress_match:
+                    current_percent = float(progress_match.group(1))
+                    steps_done = progress_match.group(2)
+                    total_steps = progress_match.group(3)
+                    avr_loss = progress_match.group(4)
+                    meta_update["progress_percent"] = current_percent
+                    meta_update["progress_text"] = (
+                        f"Paso: {steps_done}/{total_steps} ({current_percent:.1f}%), Pérdida: {avr_loss}"
+                    )
+                    last_meaningful_log = meta_update["progress_text"]
+                elif simple_percent_match:
+                    current_percent = float(simple_percent_match.group(1))
+                    meta_update["progress_percent"] = current_percent
+                    last_meaningful_log = cleaned_line
+                elif (
+                    "epoch " in cleaned_line.lower()
+                    or "saving checkpoint" in cleaned_line.lower()
+                    or "loading model" in cleaned_line.lower()
+                    or "caching latents" in cleaned_line.lower()
+                    or "model saved." in cleaned_line
+                ):
+                    last_meaningful_log = cleaned_line
+                    meta_update["progress_text"] = last_meaningful_log
+
+                # Solo actualizar el estado si hay un cambio significativo o cada N líneas para no sobrecargar
+                if current_percent is not None or (
+                    line_num % 10 == 0
+                    and meta_update["progress_text"] != last_meaningful_log
+                ):
+                    self.update_state(state="PROGRESS", meta=meta_update)
+            process.stdout.close()
+
+        return_code = process.wait()
+
+        if return_code != 0:
+            full_log_on_failure = "\n".join(log_buffer)
+            failure_reason = f"Subproceso Kohya falló con código {return_code}. Últimos logs: ...{full_log_on_failure[-1000:]}"  # Últimos 1000 caracteres
+            self.update_state(
+                state="FAILURE",
+                meta={
+                    "exc_type": "SubprocessError",
+                    "exc_message": failure_reason,
+                    "progress_text": failure_reason,
+                },
+            )
+            db_task_obj.status = "failed"
+            db_task_obj.error_message = failure_reason
             db.commit()
-            db.refresh(db_master_user)
-            print(
-                f"Usuario maestro '{MASTER_USERNAME}' creado exitosamente con email '{MASTER_EMAIL}'."
+            raise subprocess.CalledProcessError(
+                return_code, command, output=failure_reason
+            )
+
+        print(
+            f"\n[{datetime.now()}] Proceso Kohya_SS para tarea {task_id} finalizado con código {return_code}."
+        )
+
+        if (
+            os.path.exists(output_model_path_full)
+            and os.path.getsize(output_model_path_full) > 0
+        ):
+            db_task_obj.status = "completed"
+            db_task_obj.output_model_path = output_model_path_full
+            db_task_obj.error_message = None
+            final_message = (
+                f"Tarea {task_id} completada. Modelo: {output_model_path_full}"
+            )
+            print(f"[{datetime.now()}] {final_message}")
+            self.update_state(
+                state="SUCCESS",
+                meta={
+                    "progress_text": "Completado exitosamente!",
+                    "progress_percent": 100.0,
+                    "output_model_path": output_model_path_full,
+                },
             )
         else:
-            print(f"Usuario maestro '{MASTER_USERNAME}' ya existe.")
-    finally:
-        db.close()
-    print("Evento de inicio completado.")
+            final_error = f"Modelo no encontrado/vacío: {output_model_path_full}"
+            self.update_state(
+                state="FAILURE",
+                meta={
+                    "exc_type": "ModelNotFound",
+                    "exc_message": final_error,
+                    "progress_text": final_error,
+                },
+            )
+            db_task_obj.status = "failed"
+            db_task_obj.error_message = final_error
+            raise Exception(final_error)
 
-
-@app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register_user(
-    user_to_create: UserCreate,
-    db: Session = Depends(get_db),
-    current_master_user: DBUser = Depends(get_current_master_user),
-):
-    print(
-        f"Intento de registro por: '{current_master_user.username}'. Creando usuario: '{user_to_create.username}'"
-    )
-    db_user = (
-        db.query(DBUser).filter(DBUser.username == user_to_create.username).first()
-    )
-    if db_user:
-        raise HTTPException(status_code=400, detail="Username already registered")
-    if user_to_create.email:
-        db_user_email = (
-            db.query(DBUser).filter(DBUser.email == user_to_create.email).first()
-        )
-        if db_user_email:
-            raise HTTPException(status_code=400, detail="Email already registered")
-
-    hashed_password = get_password_hash(user_to_create.password)
-    new_db_user = DBUser(
-        username=user_to_create.username,
-        hashed_password=hashed_password,
-        email=user_to_create.email,
-        is_active=True,
-    )
-    db.add(new_db_user)
-    db.commit()
-    db.refresh(new_db_user)
-    return new_db_user
-
-
-@app.post("/token", response_model=Token)
-async def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
-):
-    user = db.query(DBUser).filter(DBUser.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token = create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-
-@app.get("/users/me", response_model=UserResponse)
-def read_users_me(current_user: DBUser = Depends(get_current_user)):
-    return current_user
-
-
-@app.post(
-    "/training-tasks",
-    response_model=TrainingTaskResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def create_training_task(
-    model_type: str = Form("lora"),
-    prompt: str = Form("a photo of sks style"),
-    instance_count: int = Form(10),
-    class_name: str = Form("concept"),
-    num_epochs: int = Form(5),
-    learning_rate: float = Form(1e-5),
-    resolution: int = Form(512),
-    train_batch_size: int = Form(1),
-    mixed_precision: str = Form("fp16"),
-    use_xformers: bool = Form(True),
-    enable_bucket: bool = Form(True),
-    seed: int = Form(-1),
-    output_name: str = Form("my_trained_model"),
-    cache_latents: bool = Form(True),
-    bucket_no_upscale: bool = Form(True),
-    lr_scheduler: str = Form("cosine"),
-    network_dim: int = Form(128),
-    network_alpha: int = Form(64),
-    optimizer_type: str = Form("AdamW8bit"),
-    zip_file: UploadFile = File(...),
-    current_user: DBUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    db_training_task = DBTrainingTask(
-        user_id=current_user.id,
-        status="initializing",
-        model_type=model_type,
-    )
-    db.add(db_training_task)
-    db.commit()
-    db.refresh(db_training_task)
-
-    task_id_from_db = db_training_task.id
-    user_task_base_dir = os.path.join(
-        UPLOADED_IMAGES_DIR, f"user_{current_user.id}", f"task_{task_id_from_db}"
-    )
-    os.makedirs(user_task_base_dir, exist_ok=True)
-
-    saved_filenames = []
-    image_extensions = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
-
-    try:
-        zip_content = await zip_file.read()
-        with zipfile.ZipFile(io.BytesIO(zip_content), "r") as zf:
-            for member_name in zf.namelist():
-                if (
-                    not member_name.startswith("/")
-                    and ".." not in member_name
-                    and not member_name.endswith("/")
-                    and member_name.lower().endswith(image_extensions)
-                ):
-                    filename = os.path.basename(member_name)
-                    if not filename:
-                        continue
-                    file_path = os.path.join(user_task_base_dir, filename)
-                    source = zf.open(member_name)
-                    target = open(file_path, "wb")
-                    with source, target:
-                        shutil.copyfileobj(source, target)
-                    saved_filenames.append(filename)
-    except zipfile.BadZipFile:
-        db.delete(db_training_task)
+        db_task_obj.updated_at = datetime.utcnow()
+        db.add(db_task_obj)
         db.commit()
-        raise HTTPException(status_code=400, detail="Invalid ZIP file provided.")
+
+    except subprocess.CalledProcessError as e:
+        error_message = f"Subproceso Kohya_SS (CalledProcessError) para tarea {task_id}: {str(e.output or e)}"
+        print(f"[{datetime.now()}] {error_message}", file=sys.stderr)
+        if db_task_obj:
+            db_task_obj.status = "failed"
+            db_task_obj.error_message = error_message
+            db.commit()
+        # El estado de Celery ya debería estar en FAILURE si se lanzó desde el bloque if return_code != 0
+        # Si no, lo actualizamos aquí.
+        if self.request.state != "FAILURE":
+            self.update_state(
+                state="FAILURE",
+                meta={
+                    "exc_type": type(e).__name__,
+                    "exc_message": str(e.output or e),
+                    "progress_text": "Fallo en subproceso.",
+                },
+            )
+        raise
     except Exception as e:
-        db.delete(db_training_task)
-        db.commit()
-        raise HTTPException(
-            status_code=500, detail=f"Error processing ZIP file: {str(e)}"
+        error_message = f"Error inesperado en tarea {task_id}: {str(e)}"
+        print(f"[{datetime.now()}] {error_message}", file=sys.stderr)
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        if db_task_obj:
+            db_task_obj.status = "failed"
+            db_task_obj.error_message = error_message
+            db.commit()
+        self.update_state(
+            state="FAILURE",
+            meta={
+                "exc_type": type(e).__name__,
+                "exc_message": str(e),
+                "progress_text": "Error inesperado en la tarea.",
+            },
         )
-
-    if not saved_filenames:
-        db.delete(db_training_task)
-        db.commit()
-        raise HTTPException(
-            status_code=400, detail="No valid image files found in ZIP."
-        )
-
-    training_params = {
-        "model_type": model_type,
-        "prompt": prompt,
-        "instance_count": instance_count,
-        "class_name": class_name,
-        "num_epochs": num_epochs,
-        "learning_rate": learning_rate,
-        "resolution": resolution,
-        "train_batch_size": train_batch_size,
-        "mixed_precision": mixed_precision,
-        "use_xformers": use_xformers,
-        "enable_bucket": enable_bucket,
-        "seed": seed,
-        "output_name": output_name,
-        "cache_latents": cache_latents,
-        "bucket_no_upscale": bucket_no_upscale,
-        "lr_scheduler": lr_scheduler,
-        "network_dim": network_dim,
-        "network_alpha": network_alpha,
-        "optimizer_type": optimizer_type,
-    }
-
-    db_training_task.status = "pending"
-    db_training_task.dataset_path = user_task_base_dir
-    db_training_task.prompt_config = json.dumps(
-        {
-            "user_prompt": prompt,
-            "instance_count": instance_count,
-            "class_name": class_name,
-            "output_name": output_name,
-        }
-    )
-
-    celery_task_obj = train_kohya_model.delay(
-        db_training_task.id,
-        current_user.id,
-        user_task_base_dir,
-        model_type,
-        training_params,
-        saved_filenames,
-    )
-    db_training_task.celery_task_id = celery_task_obj.id  # Guardar ID de Celery
-
-    db.add(db_training_task)
-    db.commit()
-    db.refresh(db_training_task)
-    return db_training_task
-
-
-@app.get("/training-tasks", response_model=List[TrainingTaskResponse])
-def get_user_training_tasks(
-    current_user: DBUser = Depends(get_current_user), db: Session = Depends(get_db)
-):
-    return (
-        db.query(DBTrainingTask)
-        .filter(DBTrainingTask.user_id == current_user.id)
-        .order_by(DBTrainingTask.created_at.desc())
-        .all()
-    )
-
-
-@app.get("/training-tasks/{task_id}", response_model=TrainingTaskResponse)
-def get_training_task_status(
-    task_id: int,
-    current_user: DBUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    db_task = (
-        db.query(DBTrainingTask)
-        .filter(DBTrainingTask.id == task_id, DBTrainingTask.user_id == current_user.id)
-        .first()
-    )
-    if not db_task:
-        raise HTTPException(
-            status_code=404, detail="Training task not found or unauthorized."
-        )
-
-    current_celery_status = db_task.status
-    progress_text_from_celery = None
-    progress_percent_from_celery = None
-    error_message_from_celery = db_task.error_message  # Usar el de la BD como fallback
-
-    if db_task.celery_task_id:
-        async_result = celery_app.AsyncResult(db_task.celery_task_id)
-        current_celery_status = async_result.state
-
-        if async_result.state == "PROGRESS":
-            if isinstance(async_result.info, dict):
-                progress_text_from_celery = async_result.info.get("progress_text")
-                progress_percent_from_celery = async_result.info.get("progress_percent")
-        elif async_result.state == "FAILURE":
-            error_message_from_celery = str(async_result.info)
-            if (
-                db_task.status != "failed"
-                or db_task.error_message != error_message_from_celery
-            ):
-                db_task.status = "failed"
-                db_task.error_message = error_message_from_celery
-                db.commit()
-        elif async_result.state == "SUCCESS":
-            if db_task.status != "completed":
-                db_task.status = "completed"  # Marcar como completado si Celery lo dice y BD no lo está
-                db_task.error_message = (
-                    None  # Limpiar errores previos si ahora es SUCCESS
-                )
-                db.commit()
-
-    # Si el estado de la BD es 'processing' pero Celery no tiene info de progreso detallada,
-    # o si la tarea aún no ha sido recogida por Celery (estado Celery es PENDING).
-    if current_celery_status == "PROCESSING" and not progress_text_from_celery:
-        progress_text_from_celery = "Procesando, esperando detalles de Kohya..."
-    elif current_celery_status == "PENDING" and db_task.status == "pending":
-        progress_text_from_celery = "Tarea pendiente en la cola de Celery..."
-
-    # Construir la respuesta Pydantic
-    return TrainingTaskResponse(
-        id=db_task.id,
-        user_id=db_task.user_id,
-        celery_task_id=db_task.celery_task_id,
-        status=current_celery_status,  # Priorizar estado de Celery
-        model_type=db_task.model_type,
-        dataset_path=db_task.dataset_path,
-        output_model_path=db_task.output_model_path,
-        prompt_config=db_task.prompt_config,
-        error_message=error_message_from_celery,
-        progress_text=progress_text_from_celery,
-        progress_percent=progress_percent_from_celery,
-        created_at=db_task.created_at,
-        updated_at=db_task.updated_at,  # La BD actualiza esto, o Celery podría si es necesario
-    )
-
-
-@app.get("/download-model/{task_id}")
-async def download_trained_model(
-    task_id: int,
-    current_user: DBUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    task = (
-        db.query(DBTrainingTask)
-        .filter(DBTrainingTask.id == task_id, DBTrainingTask.user_id == current_user.id)
-        .first()
-    )
-    if not task:
-        raise HTTPException(
-            status_code=404, detail="Training task not found or unauthorized."
-        )
-
-    # Consultar el estado real de Celery aquí también podría ser útil antes de permitir la descarga
-    celery_status_for_download = task.status
-    if task.celery_task_id:
-        celery_status_for_download = celery_app.AsyncResult(task.celery_task_id).state
-
-    if (
-        celery_status_for_download != "SUCCESS" or not task.output_model_path
-    ):  # Chequear contra SUCCESS de Celery
-        raise HTTPException(
-            status_code=400,
-            detail="Model not available or training did not complete successfully.",
-        )
-
-    if not os.path.exists(task.output_model_path) or not os.path.isfile(
-        task.output_model_path
-    ):
-        raise HTTPException(status_code=500, detail="Model file not found on server.")
-    return FileResponse(
-        path=task.output_model_path,
-        filename=os.path.basename(task.output_model_path),
-        media_type="application/octet-stream",
-    )
+        raise
+    finally:
+        if db:
+            db.close()
