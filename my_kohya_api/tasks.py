@@ -51,18 +51,19 @@ celery_app.conf.update(
 #     sql_app.db
 
 # Si esta es la estructura, PROJECT_ROOT apunta a la carpeta api_kohya_ss
-APP_ROOT_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..")
-)  # Esto sería api_kohya_ss/my_kohya_api/
-PROJECT_ROOT_FOR_DATA = os.path.abspath(
-    os.path.join(APP_ROOT_DIR, "..")
-)  # Esto sería api_kohya_ss/
+# --- Rutas de Archivos (Versión CORREGIDA) ---
+# Directorio del módulo actual donde está tasks.py (ej. /home/dorian/api_kohya_ss/my_kohya_api)
+CURRENT_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-UPLOADED_IMAGES_DIR = os.path.join(PROJECT_ROOT_FOR_DATA, "uploaded_images")
-TRAINED_MODELS_DIR = os.path.join(PROJECT_ROOT_FOR_DATA, "trained_models")
-KOHYA_SCRIPTS_DIR = os.path.join(
-    APP_ROOT_DIR, "kohya_scripts"
-)  # my_kohya_api/kohya_scripts/
+# Directorio raíz del proyecto (un nivel arriba, ej. /home/dorian/api_kohya_ss)
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_MODULE_DIR, ".."))
+
+# Rutas de datos (dentro de la carpeta raíz del proyecto)
+UPLOADED_IMAGES_DIR = os.path.join(PROJECT_ROOT, "uploaded_images")
+TRAINED_MODELS_DIR = os.path.join(PROJECT_ROOT, "trained_models")
+
+# Ruta a los scripts de Kohya (dentro de la carpeta del módulo my_kohya_api)
+KOHYA_SCRIPTS_DIR = os.path.join(CURRENT_MODULE_DIR, "kohya_scripts")
 
 
 @celery_app.task(
